@@ -19,6 +19,7 @@ use linked_list_allocator::Heap;
 
 pub struct EspHeap {
     heap: Mutex<RefCell<Heap>>,
+    heap2: Mutex<RefCell<Heap>>,
 }
 
 impl EspHeap {
@@ -30,6 +31,7 @@ impl EspHeap {
     pub const fn empty() -> EspHeap {
         EspHeap {
             heap: Mutex::new(RefCell::new(Heap::empty())),
+            heap2: Mutex::new(RefCell::new(Heap::empty())),
         }
     }
 
@@ -59,36 +61,82 @@ impl EspHeap {
     pub unsafe fn init(&self, heap_bottom: *mut u8, size: usize) {
         critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().init(heap_bottom, size));
     }
+    pub unsafe fn init_heap2_slice(&self, heap: &'static mut [core::mem::MaybeUninit<u8>]) {
+        critical_section::with(|cs| self.heap2.borrow(cs).borrow_mut().init_from_slice(heap));
+    }
+    pub unsafe fn init_heap2_orig(&self, heap_bottom: *mut u8, size: usize) {
+        critical_section::with(|cs| self.heap2.borrow(cs).borrow_mut().init(heap_bottom, size));
+    }
 
     /// Returns an estimate of the amount of bytes in use.
     pub fn used(&self) -> usize {
-        critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().used())
+        let mut used = critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().used());
+        used += critical_section::with(|cs| self.heap2.borrow(cs).borrow_mut().used());
+        used
     }
 
     /// Returns an estimate of the amount of bytes available.
     pub fn free(&self) -> usize {
-        critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().free())
+        let mut free = critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().free());
+        free += critical_section::with(|cs| self.heap2.borrow(cs).borrow_mut().free());
+        free 
     }
 }
 
 unsafe impl GlobalAlloc for EspHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        critical_section::with(|cs| {
+        // esp_println::println!("Heap1 alloc");
+        let mut ptr = critical_section::with(|cs| {
             self.heap
                 .borrow(cs)
                 .borrow_mut()
                 .allocate_first_fit(layout)
                 .ok()
                 .map_or(ptr::null_mut(), |allocation| allocation.as_ptr())
-        })
+        });
+        if ptr != ptr::null_mut() { return ptr }
+
+        esp_println::println!("failed alloc heap1");
+        let mut ptr = critical_section::with(|cs| {
+            self.heap2
+                .borrow(cs)
+                .borrow_mut()
+                .allocate_first_fit(layout)
+                .ok()
+                .map_or(ptr::null_mut(), |allocation| allocation.as_ptr())
+        });
+
+        // esp_println::println!("allocated at {ptr:?}");
+
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         critical_section::with(|cs| {
-            self.heap
+            // TODO: save the start/end of heaps in self, since these don't change, no need to wait to cs to decide where to enter
+            let mut borrowed_heap = self.heap
                 .borrow(cs)
-                .borrow_mut()
-                .deallocate(NonNull::new_unchecked(ptr), layout)
+                .borrow_mut();
+            if ptr >= borrowed_heap.bottom() && ptr <= borrowed_heap.top() {
+                    return borrowed_heap.deallocate(NonNull::new_unchecked(ptr), layout)
+            }
+            // self.heap
+            //     .borrow(cs)
+            //     .borrow_mut()
+            //     .deallocate(NonNull::new_unchecked(ptr), layout)
+        });
+        critical_section::with(|cs| {
+            // TODO: save the start/end of heaps in self, since these don't change, no need to wait to cs to decide where to enter
+            let mut borrowed_heap = self.heap2
+                .borrow(cs)
+                .borrow_mut();
+            if ptr >= borrowed_heap.bottom() && ptr <= borrowed_heap.top() {
+                    return borrowed_heap.deallocate(NonNull::new_unchecked(ptr), layout)
+            }
+            // self.heap
+            //     .borrow(cs)
+            //     .borrow_mut()
+            //     .deallocate(NonNull::new_unchecked(ptr), layout)
         });
     }
 }
