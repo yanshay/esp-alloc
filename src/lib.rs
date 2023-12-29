@@ -61,10 +61,31 @@ impl EspHeap {
     pub unsafe fn init(&self, heap_bottom: *mut u8, size: usize) {
         critical_section::with(|cs| self.heap.borrow(cs).borrow_mut().init(heap_bottom, size));
     }
-    pub unsafe fn init_heap2_slice(&self, heap: &'static mut [core::mem::MaybeUninit<u8>]) {
-        critical_section::with(|cs| self.heap2.borrow(cs).borrow_mut().init_from_slice(heap));
-    }
-    pub unsafe fn init_heap2_orig(&self, heap_bottom: *mut u8, size: usize) {
+
+    /// Initializes optional second heap area, mainly to utilize 2nd incontiguous ram space
+    ///
+    /// This function may be called BEFORE you run any code that makes use of
+    /// the allocator.
+    ///
+    /// `heap_bottom` is a pointer to the location of the bottom of the heap.
+    ///
+    /// `size` is the size of the heap in bytes.
+    ///
+    /// Note that:
+    ///
+    /// - The heap grows "upwards", towards larger addresses. Thus `end_addr`
+    ///   must be larger than `start_addr`
+    ///
+    /// - The size of the heap is `(end_addr as usize) - (start_addr as usize)`.
+    ///   The allocator won't use the byte at `end_addr`.
+    ///
+    /// # Safety
+    ///
+    /// Obey these or Bad Stuff will happen.
+    ///
+    /// - This function must be called exactly ONCE.
+    /// - `size > 0`
+    pub unsafe fn init_heap2(&self, heap_bottom: *mut u8, size: usize) {
         critical_section::with(|cs| self.heap2.borrow(cs).borrow_mut().init(heap_bottom, size));
     }
 
@@ -85,7 +106,6 @@ impl EspHeap {
 
 unsafe impl GlobalAlloc for EspHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // esp_println::println!("Heap1 alloc");
         let mut ptr = critical_section::with(|cs| {
             self.heap
                 .borrow(cs)
@@ -94,49 +114,35 @@ unsafe impl GlobalAlloc for EspHeap {
                 .ok()
                 .map_or(ptr::null_mut(), |allocation| allocation.as_ptr())
         });
-        if ptr != ptr::null_mut() { return ptr }
 
-        esp_println::println!("failed alloc heap1");
-        let mut ptr = critical_section::with(|cs| {
-            self.heap2
-                .borrow(cs)
-                .borrow_mut()
-                .allocate_first_fit(layout)
-                .ok()
-                .map_or(ptr::null_mut(), |allocation| allocation.as_ptr())
-        });
-
-        // esp_println::println!("allocated at {ptr:?}");
+        if ptr == ptr::null_mut() { 
+            ptr = critical_section::with(|cs| {
+                self.heap2
+                    .borrow(cs)
+                    .borrow_mut()
+                    .allocate_first_fit(layout)
+                    .ok()
+                    .map_or(ptr::null_mut(), |allocation| allocation.as_ptr())
+            });
+        };
 
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        critical_section::with(|cs| {
-            // TODO: save the start/end of heaps in self, since these don't change, no need to wait to cs to decide where to enter
-            let mut borrowed_heap = self.heap
-                .borrow(cs)
-                .borrow_mut();
+        let done = critical_section::with(|cs| {
+            let mut borrowed_heap = self.heap.borrow(cs).borrow_mut();
             if ptr >= borrowed_heap.bottom() && ptr <= borrowed_heap.top() {
-                    return borrowed_heap.deallocate(NonNull::new_unchecked(ptr), layout)
-            }
-            // self.heap
-            //     .borrow(cs)
-            //     .borrow_mut()
-            //     .deallocate(NonNull::new_unchecked(ptr), layout)
+                borrowed_heap.deallocate(NonNull::new_unchecked(ptr), layout);
+                return true;
+            };
+            return false;
         });
-        critical_section::with(|cs| {
-            // TODO: save the start/end of heaps in self, since these don't change, no need to wait to cs to decide where to enter
-            let mut borrowed_heap = self.heap2
-                .borrow(cs)
-                .borrow_mut();
-            if ptr >= borrowed_heap.bottom() && ptr <= borrowed_heap.top() {
-                    return borrowed_heap.deallocate(NonNull::new_unchecked(ptr), layout)
-            }
-            // self.heap
-            //     .borrow(cs)
-            //     .borrow_mut()
-            //     .deallocate(NonNull::new_unchecked(ptr), layout)
-        });
+        if !done {
+            critical_section::with(|cs| {
+                let mut borrowed_heap2 = self.heap2.borrow(cs).borrow_mut();
+                    borrowed_heap2.deallocate(NonNull::new_unchecked(ptr), layout);
+            });
+        }
     }
 }
